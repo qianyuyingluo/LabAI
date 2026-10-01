@@ -1,0 +1,49 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+
+# Next.js
+frontend/.next/
+frontend/out/
+frontend/.playwright/
+frontend/tsconfig.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+backend/.venv/
+backend/.sandbox-venv/
+
+# Local config and secrets
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+!backend/.env.example
+
+# Runtime data
+backend/.runtime/
+backend/app/storage/
+*.sqlite
+*.sqlite3
+*.db
+*.log
+labai-start.log
+
+# Local sample/private files
+testfiles/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
