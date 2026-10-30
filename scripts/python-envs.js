@@ -616,6 +616,8 @@ async function ensurePythonEnvironments({ backendDir }) {
         "multipart",
         "pypdf",
         "openpyxl",
+        "docx",
+        "pptx",
         "psutil",
       ],
       lockDir,

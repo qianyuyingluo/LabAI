@@ -85,6 +85,7 @@ function isCompatibleBackendHealth(payload) {
     payload &&
       payload.status === "ok" &&
       payload.capabilities?.python_sandbox === true &&
+      payload.capabilities?.workspace_agent === true &&
       payload.sandbox?.ready === true,
   );
 }
@@ -97,7 +98,7 @@ async function checkBackendReady() {
   }
   throw new Error(
     `[backend] ${backendUrl} is occupied by an incompatible or unready service. ` +
-      "Stop the old process, then run npm start again. Expected health capabilities.python_sandbox=true and sandbox.ready=true.",
+      "Stop the old process, then run npm start again. Expected workspace_agent=true, python_sandbox=true and sandbox.ready=true.",
   );
 }
 

@@ -33,10 +33,16 @@ class Settings(BaseSettings):
     database_url: str = Field(default_factory=_default_database_url)
     max_image_upload_mb: int = 10
     max_file_upload_mb: int = 25
-    max_files_skill_context_chars: int = 60000
-    files_skill_preview_chars: int = 4000
-    files_skill_upload_summary_chars: int = 12000
+    max_files_skill_context_chars: int = Field(default=60000, ge=1024, le=500000)
+    files_skill_preview_chars: int = Field(default=4000, ge=256, le=50000)
+    files_skill_upload_summary_chars: int = Field(default=12000, ge=256, le=50000)
+    # Kept for old .env files; per-file model calls are no longer performed.
     files_skill_per_file_model_chars: int = 30000
+    file_parse_timeout_seconds: int = Field(default=45, ge=1, le=300)
+    file_parse_max_concurrent: int = Field(default=2, ge=1, le=8)
+    document_max_tool_calls: int = Field(default=12, ge=1, le=100)
+    agent_max_tool_calls: int = Field(default=60, ge=1, le=500)
+    agent_context_chars: int = Field(default=120000, ge=16000, le=1000000)
     labai_sandbox_python: Path | None = None
     sandbox_timeout_seconds: int = Field(default=90, ge=1)
     sandbox_max_code_kb: int = Field(default=100, ge=1)

@@ -6,7 +6,9 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
-from app.db.models import Base, Message, ModelProfile
+from app.core.errors import AppError
+from app.db.models import AnalysisTask, Base, Message, ModelProfile, now_utc
+from app.services.agent_checkpoint import load_checkpoint
 
 
 settings = get_settings()
@@ -73,6 +75,17 @@ def ensure_schema_compatibility() -> None:
                     "ALTER TABLE model_profiles ADD COLUMN supports_tools BOOLEAN NOT NULL DEFAULT 1"
                 )
 
+        if "chats" in table_names:
+            chat_columns = {
+                row[1] for row in connection.exec_driver_sql("PRAGMA table_info(chats)")
+            }
+            if "workspace_path" not in chat_columns:
+                connection.exec_driver_sql("ALTER TABLE chats ADD COLUMN workspace_path TEXT")
+            if "workspace_mode" not in chat_columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE chats ADD COLUMN workspace_mode TEXT NOT NULL DEFAULT 'approve'"
+                )
+
         if "messages" not in table_names:
             return
 
@@ -92,6 +105,11 @@ def mark_orphaned_streaming_messages() -> None:
     with SessionLocal() as db:
         messages = list(db.scalars(select(Message).where(Message.status == "streaming")).all())
         for message in messages:
+            # The atomic checkpoint is written before the final database update.
+            # A crash between these writes must not turn completed work into an
+            # interrupted, non-resumable run.
+            if _restore_terminal_checkpoint(db, message):
+                continue
             message.status = "error"
             if not message.metadata_json:
                 continue
@@ -99,6 +117,14 @@ def mark_orphaned_streaming_messages() -> None:
                 metadata = json.loads(message.metadata_json)
             except json.JSONDecodeError:
                 continue
+            agent = metadata.get("workspaceAgent") if isinstance(metadata, dict) else None
+            if isinstance(agent, dict):
+                message.status = "interrupted"
+                agent["status"] = "interrupted"
+                for call in agent.get("calls", []):
+                    if isinstance(call, dict) and call.get("status") in {"running", "waiting_approval"}:
+                        call["status"] = "interrupted"
+                message.metadata_json = json.dumps(metadata, ensure_ascii=False)
             plan = metadata.get("plan") if isinstance(metadata, dict) else None
             if not isinstance(plan, dict):
                 continue
@@ -106,7 +132,45 @@ def mark_orphaned_streaming_messages() -> None:
             if not plan.get("markdown"):
                 plan["markdown"] = message.content
             message.metadata_json = json.dumps(metadata, ensure_ascii=False)
+        db.flush()
+        tasks = db.scalars(select(AnalysisTask).where(AnalysisTask.status == "executing")).all()
+        for task in tasks:
+            task.status = "interrupted"
+            task.updated_at = now_utc()
         db.commit()
+
+
+def _restore_terminal_checkpoint(db: Session, message: Message) -> bool:
+    try:
+        checkpoint = load_checkpoint(message.id)
+    except (AppError, OSError, ValueError):
+        return False
+    metadata = checkpoint.get("metadata")
+    content = checkpoint.get("content")
+    usage = checkpoint.get("usage")
+    status = checkpoint.get("status")
+    if (
+        status not in {"done", "cancelled"}
+        or checkpoint.get("message_id") != message.id
+        or checkpoint.get("chat_id") != message.chat_id
+        or not isinstance(metadata, dict)
+        or not isinstance(metadata.get("workspaceAgent"), dict)
+        or not isinstance(content, str)
+        or (usage is not None and not isinstance(usage, dict))
+    ):
+        return False
+    message.status = status
+    message.content = content
+    metadata["workspaceAgent"]["status"] = status
+    message.metadata_json = json.dumps(metadata, ensure_ascii=False)
+    message.token_usage_json = json.dumps(usage, ensure_ascii=False) if usage is not None else None
+    execution = metadata.get("execution")
+    task_id = execution.get("taskId") if isinstance(execution, dict) else None
+    task = db.get(AnalysisTask, task_id) if isinstance(task_id, str) else None
+    if task is not None and task.chat_id == message.chat_id:
+        task.status = status
+        task.updated_at = now_utc()
+    return True
 
 
 def seed_default_model_profile() -> None:

@@ -7,6 +7,8 @@ import {
   ImagePlus,
   Plus,
   Send,
+  Square,
+  Loader2,
   ToggleLeft,
   ToggleRight,
   X,
@@ -20,6 +22,8 @@ import { AttachmentPreview } from "@/components/chat/AttachmentPreview";
 type ChatComposerProps = {
   attachments: Attachment[];
   disabled?: boolean;
+  onStop?: () => void;
+  stopping?: boolean;
   locale: Locale;
   onAttachmentsChange: (files: Attachment[]) => void;
   onPlanModeChange: (planMode: boolean) => void;
@@ -32,6 +36,8 @@ type ChatComposerProps = {
 export function ChatComposer({
   attachments,
   disabled = false,
+  onStop,
+  stopping = false,
   locale,
   onAttachmentsChange,
   onPlanModeChange,
@@ -237,14 +243,18 @@ export function ChatComposer({
             </button>
           )}
 
-          <button
+          {onStop ? (
+            <button type="button" aria-label={locale === "zh" ? "停止任务" : "Stop task"} title={locale === "zh" ? "停止任务和运行中的命令" : "Stop task and running commands"} className="mb-1 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-ink text-surface disabled:opacity-50" disabled={stopping} onClick={onStop}>
+              {stopping ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-4 w-4 fill-current" />}
+            </button>
+          ) : <button
             aria-label={t.send}
             className="mb-1 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-ink text-surface transition hover:opacity-85 disabled:cursor-not-allowed disabled:bg-line disabled:text-muted"
             disabled={disabled || (!value.trim() && attachments.length === 0)}
             type="submit"
           >
             <Send className="h-4 w-4" />
-          </button>
+          </button>}
         </div>
       </form>
       <p className="mt-2 w-full text-center text-xs text-muted">

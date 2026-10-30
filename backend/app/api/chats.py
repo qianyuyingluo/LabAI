@@ -23,6 +23,8 @@ class ChatListItem(BaseModel):
     created_at: datetime
     updated_at: datetime
     model_profile_id: str | None
+    workspace_path: str | None = None
+    workspace_mode: str = "approve"
     message_count: int
     last_message_preview: str | None = None
     has_active_run: bool = False
@@ -65,6 +67,8 @@ class ChatDetail(BaseModel):
     created_at: datetime
     updated_at: datetime
     model_profile_id: str | None
+    workspace_path: str | None = None
+    workspace_mode: str = "approve"
     messages: list[ChatMessageItem]
 
 
@@ -99,6 +103,8 @@ async def list_chats(db: Session = Depends(get_session)) -> list[ChatListItem]:
                 created_at=chat.created_at,
                 updated_at=chat.updated_at,
                 model_profile_id=chat.model_profile_id,
+                workspace_path=chat.workspace_path,
+                workspace_mode=chat.workspace_mode,
                 message_count=message_count or 0,
                 last_message_preview=preview,
                 has_active_run=has_active_run,
@@ -128,6 +134,8 @@ async def get_chat(chat_id: str, db: Session = Depends(get_session)) -> ChatDeta
         created_at=chat.created_at,
         updated_at=chat.updated_at,
         model_profile_id=chat.model_profile_id,
+        workspace_path=chat.workspace_path,
+        workspace_mode=chat.workspace_mode,
         messages=[ChatMessageItem.from_message(message, db) for message in messages],
     )
 

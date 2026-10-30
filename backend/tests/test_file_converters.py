@@ -8,30 +8,85 @@ from unittest.mock import patch
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
-TESTFILES_DIR = Path(os.environ.get("LABAI_TESTFILES_DIR", ROOT_DIR / "testfiles"))
 TEMP_DIR = Path(tempfile.mkdtemp(prefix="labai-file-converters-"))
-
-os.environ["BACKEND_STORAGE_DIR"] = str(TEMP_DIR / "storage")
-os.environ["DATABASE_URL"] = "sqlite:///" + (TEMP_DIR / "labai.sqlite3").as_posix()
+TESTFILES_DIR = Path(os.environ.get("LABAI_TESTFILES_DIR", TEMP_DIR / "fixtures"))
 
 from fastapi.testclient import TestClient  # noqa: E402
+from sqlalchemy import create_engine  # noqa: E402
+from sqlalchemy.orm import sessionmaker  # noqa: E402
 
 from app.main import app  # noqa: E402
-from app.adapters.base import AdapterResponse  # noqa: E402
 from app.db.models import Chat, Message, ModelProfile  # noqa: E402
 from app.db.session import SessionLocal  # noqa: E402
+from app.db import session as db_session  # noqa: E402
+from app.core.config import get_settings  # noqa: E402
 from app.skills.files_skill import FilesSkillService  # noqa: E402
 
 
 class FileConverterUploadTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        if not os.environ.get("LABAI_TESTFILES_DIR"):
+            cls._make_fixtures()
+        # Isolate even when another test imported app/session before this module.
+        cls.environment = patch.dict(os.environ, {
+            "BACKEND_STORAGE_DIR": str(TEMP_DIR / "storage"),
+            "DATABASE_URL": "sqlite:///" + (TEMP_DIR / "labai.sqlite3").as_posix(),
+        })
+        cls.environment.start()
+        get_settings.cache_clear()
+        cls.engine = create_engine(get_settings().database_url, connect_args={"check_same_thread": False})
+        sessions = sessionmaker(bind=cls.engine, autocommit=False, autoflush=False)
+        cls.patches = [patch.object(db_session, "settings", get_settings()),
+                       patch.object(db_session, "engine", cls.engine),
+                       patch.object(db_session, "SessionLocal", sessions),
+                       patch(__name__ + ".SessionLocal", sessions)]
+        for active_patch in cls.patches:
+            active_patch.start()
         cls.client = TestClient(app)
         cls.client.__enter__()
+
+    @staticmethod
+    def _make_fixtures() -> None:
+        from docx import Document
+        from openpyxl import Workbook
+        from pptx import Presentation
+        from pypdf import PdfWriter
+        from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+        TESTFILES_DIR.mkdir(parents=True, exist_ok=True)
+        workbook = Workbook()
+        workbook.active.append(["sample", "weight"])
+        workbook.active.append(["A", 12.5])
+        workbook.save(TESTFILES_DIR / "weight.xlsx")
+        document = Document()
+        document.add_heading("Experiment notes", 1)
+        document.add_paragraph("Sample A weighs 12.5 grams.")
+        document.save(TESTFILES_DIR / "notes.docx")
+        presentation = Presentation()
+        slide = presentation.slides.add_slide(presentation.slide_layouts[1])
+        slide.shapes.title.text = "Experiment results"
+        slide.placeholders[1].text = "Sample A weighs 12.5 grams."
+        presentation.save(TESTFILES_DIR / "results.pptx")
+        writer = PdfWriter()
+        page = writer.add_blank_page(width=300, height=300)
+        font = DictionaryObject({NameObject("/Type"): NameObject("/Font"),
+                                 NameObject("/Subtype"): NameObject("/Type1"),
+                                 NameObject("/BaseFont"): NameObject("/Helvetica")})
+        page[NameObject("/Resources")] = DictionaryObject({NameObject("/Font"): DictionaryObject({NameObject("/F1"): font})})
+        stream = DecodedStreamObject()
+        stream.set_data(b"BT /F1 12 Tf 20 100 Td (Sample A weighs 12.5 grams.) Tj ET")
+        page[NameObject("/Contents")] = stream
+        writer.write(TESTFILES_DIR / "results.pdf")
 
     @classmethod
     def tearDownClass(cls) -> None:
         cls.client.__exit__(None, None, None)
+        cls.engine.dispose()
+        for active_patch in reversed(cls.patches):
+            active_patch.stop()
+        cls.environment.stop()
+        get_settings.cache_clear()
         shutil.rmtree(TEMP_DIR, ignore_errors=True)
 
     def test_testfiles_upload_and_parse(self) -> None:
@@ -165,7 +220,7 @@ class FileConverterUploadTests(unittest.TestCase):
         self.assertEqual(result.files[0].file_id, str(current_payload["file_id"]))
         self.assertIn("weight.xlsx", result.model_context)
 
-    def test_files_skill_model_call_isolated_per_file(self) -> None:
+    def test_files_skill_uses_source_without_per_file_model_calls(self) -> None:
         uploaded_ids = []
         for pattern, mime_type in [
             ("*.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
@@ -173,20 +228,6 @@ class FileConverterUploadTests(unittest.TestCase):
         ]:
             uploaded_ids.append(str(self._upload(self._first_testfile(pattern), mime_type)["file_id"]))
 
-        class FakeAdapter:
-            def __init__(self) -> None:
-                self.calls: list[list[dict[str, str]]] = []
-
-            async def chat(self, **kwargs: object) -> AdapterResponse:
-                messages = kwargs["messages"]
-                assert isinstance(messages, list)
-                self.calls.append(messages)
-                user_content = str(messages[-1]["content"])
-                if "weight.xlsx" in user_content:
-                    return AdapterResponse(content="独立回答: weight.xlsx 是一个表格文件。")
-                return AdapterResponse(content="独立回答: docx 是一个文档文件。")
-
-        fake = FakeAdapter()
         profile = ModelProfile(
             name="fake",
             provider="openai_compat",
@@ -198,7 +239,7 @@ class FileConverterUploadTests(unittest.TestCase):
         async def run_case() -> None:
             with SessionLocal() as db:
                 service = FilesSkillService(db)
-                with patch("app.skills.files_skill.service.get_adapter_for_profile", return_value=fake):
+                with patch("app.adapters.registry.get_adapter_for_profile", side_effect=AssertionError("Unexpected model call")) as adapter:
                     result = await service.run_with_model(
                         chat_id=None,
                         file_ids=uploaded_ids,
@@ -206,13 +247,11 @@ class FileConverterUploadTests(unittest.TestCase):
                         user_message="这是什么",
                     )
             self.assertEqual(result.status, "done")
-            self.assertEqual(len(fake.calls), 2)
-            self.assertIn("files_skill per-file model context", result.model_context)
-            self.assertIn("独立回答: docx 是一个文档文件。", result.model_context)
-            self.assertIn("独立回答: weight.xlsx 是一个表格文件。", result.model_context)
-            for call in fake.calls:
-                self.assertEqual([message["role"] for message in call], ["system", "user"])
-                self.assertNotIn("files_skill per-file model context", str(call))
+            adapter.assert_not_called()
+            self.assertIn("files_skill context", result.model_context)
+            self.assertIn("weight.xlsx", result.model_context)
+            self.assertIn("12.5", result.model_context)
+            self.assertTrue(all(not file.skill_output for file in result.files))
 
         asyncio.run(run_case())
 

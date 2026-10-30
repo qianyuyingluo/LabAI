@@ -1,27 +1,19 @@
-from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from app.db.models import UploadedFile
-from app.parsers.docx_parser import parse_docx
-from app.parsers.excel_parser import parse_xlsx
-from app.parsers.pdf_parser import parse_pdf
-from app.parsers.pptx_parser import parse_pptx
-from app.parsers.text_parser import clean_text, parse_delimited, parse_text
+from app.parsers.docx_parser import extract_docx
+from app.parsers.excel_parser import extract_xlsx
+from app.parsers.pdf_parser import extract_pdf
+from app.parsers.pptx_parser import extract_pptx
+from app.parsers.text_parser import extract_delimited, extract_json, extract_text
+from app.parsers.types import DocumentContent, ParseLimitError, ParsedFileText, check_input_size
 
-
-@dataclass(slots=True)
-class ParsedFileText:
-    file_id: str
-    filename: str
-    file_type: str
-    mime_type: str
-    size: int
-    text: str = ""
-    text_chars: int = 0
-    error: str | None = None
+if TYPE_CHECKING:
+    from app.db.models import UploadedFile
 
 
-def parse_uploaded_file(uploaded: UploadedFile) -> ParsedFileText:
+def parse_uploaded_file(uploaded: "UploadedFile") -> ParsedFileText:
+    """Extract source blocks without invoking a model or changing the original file."""
     path = Path(uploaded.local_path)
     result = ParsedFileText(
         file_id=uploaded.id,
@@ -31,44 +23,61 @@ def parse_uploaded_file(uploaded: UploadedFile) -> ParsedFileText:
         size=uploaded.size,
     )
 
+    if not path.is_file():
+        result.error = "File is missing on disk."
+        result.parse_status = "error"
+        return result
     if uploaded.file_type == "image":
         result.text = "Image file. Use the uploaded image ID as a vision input."
         result.text_chars = len(result.text)
-        return result
-
-    if not path.is_file():
-        result.error = "File is missing on disk."
+        result.parse_status = "unsupported"
+        result.warnings = ["Local text extraction does not perform OCR on images."]
+        result.metadata = {"requires_vision": True}
         return result
 
     try:
-        result.text = clean_text(_parse_content(path, uploaded.extension.lower(), uploaded.file_type))
+        check_input_size(path)
+        content = _extract_content(path, uploaded.extension.lower().lstrip("."), uploaded.file_type)
+        result.blocks = content.blocks
+        result.text = content.text
+        result.warnings = content.warnings
+        result.metadata = content.metadata
+        result.parse_status = content.parse_status
+        result.error = content.error
+    except ParseLimitError as exc:
+        result.parse_status = "partial"
+        result.error = str(exc)
+        result.warnings = [str(exc)]
+        result.metadata = {"parse_truncated": True}
     except Exception as exc:
+        result.parse_status = "error"
         result.error = f"{exc.__class__.__name__}: {exc}"
-        result.text = ""
 
-    if not result.text and not result.error:
+    if not result.blocks and not result.error:
         result.error = "No text content could be extracted."
+        if result.parse_status == "success":
+            result.parse_status = "error"
 
     result.text_chars = len(result.text)
     return result
 
 
-def _parse_content(path: Path, extension: str, file_type: str) -> str:
+def _extract_content(path: Path, extension: str, file_type: str) -> DocumentContent:
     if extension in {"txt", "md"}:
-        return parse_text(path)
+        return extract_text(path)
     if extension in {"csv", "tsv"}:
-        return parse_delimited(path, "\t" if extension == "tsv" else ",")
-    if extension == "xlsx":
-        return parse_xlsx(path)
-    if extension == "pdf":
-        return parse_pdf(path)
-    if extension == "docx":
-        return parse_docx(path)
-    if extension == "pptx":
-        return parse_pptx(path)
+        return extract_delimited(path, "\t" if extension == "tsv" else ",")
+    if extension == "json":
+        return extract_json(path)
+    parsers = {"xlsx": extract_xlsx, "pdf": extract_pdf, "docx": extract_docx, "pptx": extract_pptx}
+    if extension in parsers:
+        return parsers[extension](path)
     if extension in {"doc", "xls", "ppt"}:
-        return (
-            "This legacy binary Office format was saved, but local text extraction is not "
-            "available. Convert it to docx, xlsx, or pptx for richer context."
-        )
-    return f"No parser is available for file type '{file_type}' with extension '{extension}'."
+        message = "Legacy binary Office extraction is unsupported. Convert the file to docx, xlsx, or pptx."
+    else:
+        message = f"No parser is available for file type '{file_type}' with extension '{extension}'."
+    return DocumentContent(parse_status="unsupported", error=message, warnings=[message])
+
+
+def _parse_content(path: Path, extension: str, file_type: str) -> str:
+    return _extract_content(path, extension, file_type).text

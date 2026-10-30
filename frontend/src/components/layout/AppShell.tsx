@@ -14,9 +14,14 @@ import type {
   ModelProfileInput,
   PlanPrompt,
   PlanStatus,
+  WorkspaceMode,
 } from "@/lib/types";
 import type { BackendMessage, RunStartResponse } from "@/lib/api";
 import {
+  approveToolCall,
+  cancelRun,
+  resumeRun,
+  updateChatWorkspace,
   createModelProfile,
   deleteChat,
   deleteModelProfile,
@@ -40,6 +45,8 @@ import {
   createId,
   mapMessages,
 } from "@/lib/chat-store";
+import { AgentActionsContext } from "@/components/chat/AgentTrace";
+import { WorkspacePanel } from "@/components/layout/WorkspacePanel";
 import { ChatComposer } from "@/components/chat/ChatComposer";
 import { ChatViewport } from "@/components/chat/ChatViewport";
 import { MobileSidebar } from "@/components/layout/MobileSidebar";
@@ -62,6 +69,8 @@ type ChatSession = {
   messageIds: string[];
   messagesById: Record<string, ChatMessage>;
   planMode: boolean;
+  workspacePath: string | null;
+  workspaceMode: WorkspaceMode;
 };
 
 const SELECTED_MODEL_STORAGE_KEY = "labai.selectedModelProfileId";
@@ -77,6 +86,8 @@ function createEmptySession(chatId: string | null = null): ChatSession {
     messageIds: [],
     messagesById: {},
     planMode: false,
+    workspacePath: null,
+    workspaceMode: "approve",
   };
 }
 
@@ -315,6 +326,8 @@ function backendMessageToChatMessage(message: BackendMessage | ChatHistoryDetail
     status: message.status,
     attachments: attachments.length ? attachments : undefined,
     filesSkill,
+    documentTools: metadata?.documentTools,
+    workspaceAgent: metadata?.workspaceAgent,
     pythonSandbox,
     generatedFiles,
     createdAt: new Date(message.created_at).getTime(),
@@ -378,6 +391,9 @@ function addMessagesToSession(session: ChatSession, messages: ChatMessage[]) {
 }
 
 export function AppShell() {
+  const [stopping, setStopping] = useState(false);
+  const [runControlError, setRunControlError] = useState("");
+  const [starting, setStarting] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -492,12 +508,35 @@ export function AppShell() {
             type: normalizePlan(metadata) ? "plan" : type,
             attachments: attachments.length ? attachments : current?.attachments,
             filesSkill: normalizeFilesSkill(metadata),
+            documentTools: metadata?.documentTools,
+            workspaceAgent: metadata?.workspaceAgent,
             pythonSandbox: normalizePythonSandbox(metadata),
             generatedFiles: normalizeGeneratedFiles(metadata),
             planMode: Boolean(metadata?.planMode || metadata?.plainMode),
             plan: normalizePlan(metadata),
           };
           return addMessagesToSession(session, [nextMessage]);
+        });
+        return;
+      }
+
+      if (event.event === "workspace_agent_status") {
+        const workspaceAgent = event.data.workspaceAgent as ChatMessage["workspaceAgent"];
+        if (!workspaceAgent || !Array.isArray(workspaceAgent.calls)) return;
+        updateSessionByChatId(chatId, (session) => {
+          const current = session.messagesById[messageId];
+          return current ? addMessagesToSession(session, [{ ...current, workspaceAgent }]) : session;
+        });
+        return;
+      }
+
+      if (event.event === "document_tools_status") {
+        const documentTools = event.data.documentTools as ChatMessage["documentTools"];
+        if (!documentTools || !Array.isArray(documentTools.calls)) return;
+        updateSessionByChatId(chatId, (session) => {
+          const current = session.messagesById[messageId];
+          if (!current) return session;
+          return addMessagesToSession(session, [{ ...current, documentTools }]);
         });
         return;
       }
@@ -658,7 +697,10 @@ export function AppShell() {
           const nextSession = addMessagesToSession(session, [
             {
               ...current,
-              status: ok ? "done" : "error",
+              status: event.data.status === "cancelled" || event.data.status === "interrupted"
+                ? event.data.status
+                : current.status === "cancelled" || current.status === "interrupted"
+                  ? current.status : ok ? "done" : "error",
               plan: nextPlan,
             },
           ]);
@@ -684,20 +726,25 @@ export function AppShell() {
       const controller = new AbortController();
       activeSubscriptionsRef.current.set(messageId, controller);
       try {
-        const response = await openRunMessageStream(messageId, controller.signal);
-        await readSseStream(response, (event) => applyRunEvent(chatId, messageId, event));
-      } catch (error) {
-        if (!(error instanceof DOMException && error.name === "AbortError")) {
-          const message = formatError(error, locale);
-          if (message) {
-            applyRunEvent(chatId, messageId, {
-              event: "error",
-              data: { message },
-            });
+        while (!controller.signal.aborted) {
+          try {
+            const response = await openRunMessageStream(messageId, controller.signal);
+            setRunControlError("");
+            await readSseStream(response, (event) => applyRunEvent(chatId, messageId, event));
+          } catch (error) {
+            if (controller.signal.aborted) break;
+            // A transport failure does not mean the backend task failed. Keep
+            // Stop available and reconnect to the persisted message snapshot.
+            setRunControlError(locale === "zh"
+              ? `执行连接中断，正在重新连接。${formatError(error, locale)}`
+              : `Execution connection lost; reconnecting. ${formatError(error, locale)}`);
           }
+          if (!controller.signal.aborted) await sleep(1500);
         }
       } finally {
-        activeSubscriptionsRef.current.delete(messageId);
+        if (activeSubscriptionsRef.current.get(messageId) === controller) {
+          activeSubscriptionsRef.current.delete(messageId);
+        }
       }
     },
     [applyRunEvent, locale],
@@ -726,6 +773,8 @@ export function AppShell() {
           messageIds: messages.map((message) => message.id),
           messagesById: mapMessages(messages),
           planMode: shouldResumePlanMode(messages),
+          workspacePath: detail.workspace_path ?? null,
+          workspaceMode: detail.workspace_mode ?? "approve",
         },
       }));
       setCurrentSessionKey(detail.id);
@@ -871,6 +920,8 @@ export function AppShell() {
             chatId,
             draftText: "",
             planMode: nextPlanMode,
+            workspacePath: response.chat?.workspace_path !== undefined ? response.chat.workspace_path : source.workspacePath,
+            workspaceMode: response.chat?.workspace_mode ?? source.workspaceMode,
           },
           incoming,
         );
@@ -891,7 +942,9 @@ export function AppShell() {
   const handleSend = useCallback(
     async (message: string, files: Attachment[]) => {
       const session = sessionsByKey[currentSessionKey] ?? createEmptySession();
-      if (sessionHasRunning(session)) return;
+      if (sessionHasRunning(session) || starting) return;
+      setStarting(true);
+      setRunControlError("");
 
       try {
         if (!currentModel) {
@@ -940,6 +993,8 @@ export function AppShell() {
           image_file_ids: imageFileIds,
           message,
           model_profile_id: currentModel,
+          workspace_path: session.workspacePath,
+          workspace_mode: session.workspaceMode,
         };
         const response = session.planMode
           ? await startPlanGenerateRun(payload)
@@ -948,9 +1003,12 @@ export function AppShell() {
       } catch (error) {
         const messageText = formatError(error, locale);
         if (messageText) window.alert(messageText);
+      } finally {
+        setStarting(false);
       }
     },
     [
+      starting,
       applyRunStartResponse,
       currentModel,
       currentSessionKey,
@@ -960,6 +1018,35 @@ export function AppShell() {
       uploadMessageAttachments,
     ],
   );
+
+  const handleWorkspaceChange = async (path: string | null, mode: WorkspaceMode) => {
+    if (currentSession.chatId) await updateChatWorkspace(currentSession.chatId, path, mode);
+    updateCurrentSession((session) => ({ ...session, workspacePath: path, workspaceMode: mode }));
+    void refreshChatHistory();
+  };
+
+  const handleStop = async () => {
+    const messageId = getRunningMessageIds(currentSession)[0];
+    if (!messageId || stopping) return;
+    setStopping(true); setRunControlError("");
+    try {
+      await cancelRun(messageId);
+      // Load the authoritative final snapshot even if this browser lost its SSE connection.
+      if (currentSession.chatId) await loadChat(currentSession.chatId);
+    } catch (error) { setRunControlError(formatError(error, locale)); }
+    finally { setStopping(false); }
+  };
+
+  const agentActions = {
+    running: currentRunning || starting,
+    approve: async (messageId: string, callId: string, approved: boolean) => {
+      await approveToolCall(messageId, callId, approved);
+    },
+    resume: async (messageId: string) => {
+      const response = await resumeRun(messageId);
+      applyRunStartResponse(currentSessionKey, response);
+    },
+  };
 
   const handleApprovePlan = useCallback(
     async (planMessageId: string, planId: string) => {
@@ -1197,6 +1284,7 @@ export function AppShell() {
   }, [locale]);
 
   return (
+    <AgentActionsContext.Provider value={agentActions}>
     <div className="flex h-screen overflow-hidden bg-surface text-ink">
       <Sidebar
         chats={chatHistory}
@@ -1246,6 +1334,15 @@ export function AppShell() {
           setCurrentModel={selectModelProfile}
         />
 
+        <WorkspacePanel
+          key={`${currentSessionKey}-${currentSession.workspacePath ?? ""}-${currentSession.workspaceMode}`}
+          chatId={currentSession.chatId}
+          path={currentSession.workspacePath}
+          mode={currentSession.workspaceMode}
+          disabled={currentRunning || starting}
+          locale={locale}
+          onChange={handleWorkspaceChange}
+        />
         <ChatViewport
           conversationKey={currentSessionKey}
           getMessage={getMessage}
@@ -1258,9 +1355,10 @@ export function AppShell() {
           streamingMessageId={undefined}
         />
 
+        {runControlError ? <p role="alert" className="px-5 py-2 text-xs text-red-600">{runControlError}</p> : null}
         <ChatComposer
           attachments={currentSession.attachments}
-          disabled={currentRunning}
+          disabled={currentRunning || starting}
           locale={locale}
           onAttachmentsChange={(attachments) =>
             updateCurrentSession((session) => ({ ...session, attachments }))
@@ -1269,6 +1367,8 @@ export function AppShell() {
             updateCurrentSession((session) => ({ ...session, planMode }))
           }
           onSend={handleSend}
+          onStop={currentRunning ? handleStop : undefined}
+          stopping={stopping}
           onValueChange={(draftText) =>
             updateCurrentSession((session) => ({ ...session, draftText }))
           }
@@ -1304,5 +1404,6 @@ export function AppShell() {
         prompts={planPrompts}
       />
     </div>
+    </AgentActionsContext.Provider>
   );
 }

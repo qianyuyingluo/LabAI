@@ -9,6 +9,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import psutil
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -181,6 +183,111 @@ class PythonSandboxTests(unittest.TestCase):
 
         self.assertFalse(result.ok)
         self.assertTrue(result.timed_out)
+
+    def test_cancellation_stops_real_python_process(self) -> None:
+        workspace = self._workspace()
+        self.settings.sandbox_timeout_seconds = 10
+        spawned = []
+        real_spawn = asyncio.create_subprocess_exec
+
+        async def scenario():
+            async def capture(*args, **kwargs):
+                process = await real_spawn(*args, **kwargs)
+                spawned.append(process)
+                return process
+
+            with patch("app.services.python_sandbox.asyncio.create_subprocess_exec", capture):
+                task = asyncio.create_task(workspace.execute(
+                    "from pathlib import Path\nimport time\nPath('outputs/started.txt').write_text('started')\ntime.sleep(60)\n"
+                ))
+                try:
+                    async with asyncio.timeout(5):
+                        while not (workspace.outputs_dir / "started.txt").exists():
+                            await asyncio.sleep(0.02)
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+                    self.assertIsNotNone(spawned[0].returncode)
+                    self.assertFalse(psutil.pid_exists(spawned[0].pid))
+                finally:
+                    if not task.done():
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                    for process in spawned:
+                        if process.returncode is None:
+                            process.kill()
+                            await process.wait()
+        asyncio.run(scenario())
+
+    def test_cancellation_during_spawn_waits_for_handle_then_stops_process(self) -> None:
+        workspace = self._workspace()
+        spawned = []
+        real_spawn = asyncio.create_subprocess_exec
+
+        async def scenario():
+            created = asyncio.Event()
+            async def delayed_spawn(*args, **kwargs):
+                process = await real_spawn(*args, **kwargs)
+                spawned.append(process)
+                created.set()
+                await asyncio.sleep(0.05)
+                return process
+
+            with patch("app.services.python_sandbox.asyncio.create_subprocess_exec", delayed_spawn):
+                task = asyncio.create_task(workspace.execute("import time\ntime.sleep(60)\n"))
+                try:
+                    await asyncio.wait_for(created.wait(), timeout=5)
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+                    self.assertIsNotNone(spawned[0].returncode)
+                    self.assertFalse(psutil.pid_exists(spawned[0].pid))
+                finally:
+                    if not task.done():
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                    for process in spawned:
+                        if process.returncode is None:
+                            process.kill()
+                            await process.wait()
+        asyncio.run(scenario())
+
+    def test_cancellation_reaps_real_descendant_process(self) -> None:
+        workspace = self._workspace()
+        self.settings.sandbox_timeout_seconds = 10
+        child_pid = None
+
+        async def scenario():
+            nonlocal child_pid
+            # Bypass only the Python policy in this lifecycle test so a real
+            # descendant can exercise the process-tree cleanup path.
+            with (
+                patch("app.services.python_sandbox._validate_code_policy", return_value=None),
+                patch("app.services.python_sandbox._runner_source", return_value="import runpy, sys\nrunpy.run_path(sys.argv[1])\n"),
+            ):
+                task = asyncio.create_task(workspace.execute(
+                    "import subprocess, sys, time\nfrom pathlib import Path\n"
+                    "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                    "Path('outputs/child.txt').write_text(str(child.pid))\ntime.sleep(60)\n"
+                ))
+                try:
+                    async with asyncio.timeout(5):
+                        while not (workspace.outputs_dir / "child.txt").exists():
+                            await asyncio.sleep(0.02)
+                    child_pid = int((workspace.outputs_dir / "child.txt").read_text())
+                    self.assertTrue(psutil.pid_exists(child_pid))
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+                    if psutil.pid_exists(child_pid):
+                        self.assertEqual(psutil.Process(child_pid).status(), psutil.STATUS_ZOMBIE)
+                finally:
+                    if not task.done():
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                    if child_pid and psutil.pid_exists(child_pid):
+                        psutil.Process(child_pid).kill()
+        asyncio.run(scenario())
 
     def test_readiness_probe_is_cached_and_invalidated_by_interpreter_mtime(self) -> None:
         python = self.temp_dir / ".sandbox-venv" / "Scripts" / "python.exe"

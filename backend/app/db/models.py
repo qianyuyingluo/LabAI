@@ -45,6 +45,8 @@ class Chat(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
     title: Mapped[str] = mapped_column(String(200), nullable=False)
+    workspace_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    workspace_mode: Mapped[str] = mapped_column(String(20), nullable=False, default="approve")
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_utc)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=now_utc, onupdate=now_utc

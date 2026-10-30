@@ -1,6 +1,6 @@
 import json
 import time
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
@@ -9,6 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.adapters.registry import get_adapter_for_profile
+from app.api.workspaces import bind_workspace
 from app.core.database import get_session
 from app.core.errors import (
     CHAT_RUNNING,
@@ -50,6 +51,8 @@ class StartChatRunRequest(BaseModel):
     file_ids: list[str] = Field(default_factory=list)
     file_summaries: list[str] = Field(default_factory=list)
     extra_params: dict[str, Any] | None = None
+    workspace_path: str | None = None
+    workspace_mode: Literal["approve", "auto"] | None = None
 
     @model_validator(mode="after")
     def require_message_or_image(self) -> "StartChatRunRequest":
@@ -73,6 +76,34 @@ class RevisePlanRunRequest(BaseModel):
     extra_params: dict[str, Any] | None = None
 
 
+class ToolApprovalRequest(BaseModel):
+    call_id: str = Field(min_length=1, max_length=200)
+    approved: bool
+
+
+@router.post("/messages/{message_id}/approval")
+async def approve_tool(
+    message_id: str, body: ToolApprovalRequest, db: Session = Depends(get_session),
+) -> dict[str, bool]:
+    message = db.get(Message, message_id)
+    if message is None:
+        raise AppError("MESSAGE_NOT_FOUND", "Run was not found.", status_code=404)
+    if not run_manager.resolve_approval(message_id, body.call_id, body.approved):
+        raise AppError("APPROVAL_NOT_PENDING", "This tool call is no longer awaiting approval.", status_code=409)
+    return {"ok": True}
+
+
+@router.post("/messages/{message_id}/cancel")
+async def cancel_run(message_id: str, db: Session = Depends(get_session)) -> dict[str, Any]:
+    message = db.get(Message, message_id)
+    if message is None:
+        raise AppError("MESSAGE_NOT_FOUND", "Run was not found.", status_code=404)
+    await run_manager.cancel(message_id)
+    db.expire_all()
+    message = db.get(Message, message_id)
+    return {"ok": True, "message_id": message_id, "status": message.status}
+
+
 @router.post("/chat")
 async def start_chat_run(
     body: StartChatRunRequest,
@@ -81,6 +112,7 @@ async def start_chat_run(
     profile = _get_streaming_profile(db, body.model_profile_id)
     chat = _get_or_create_chat(db, body.chat_id, profile, body.message or "New chat")
     _ensure_chat_can_start(db, chat.id)
+    _bind_requested_workspace(db, chat, body)
     history = [
         *system_prompt_messages(profile),
         *_load_done_history(db, chat.id),
@@ -143,6 +175,7 @@ async def start_plan_generate_run(
     image_infos = PlanSkillService(db).load_image_infos(body.image_file_ids, profile)
     chat = _get_or_create_chat(db, body.chat_id, profile, body.message or "Plan Mode analysis")
     _ensure_chat_can_start(db, chat.id)
+    _bind_requested_workspace(db, chat, body)
     user_metadata = _message_input_metadata(
         db,
         _attachment_file_ids(body.file_ids, body.image_file_ids),
@@ -258,7 +291,7 @@ async def start_plan_approve_run(
         "streaming",
         profile.id,
         "execution_result",
-        None,
+        {"execution": {"taskId": task.id, "planId": plan.id}},
     )
     db.commit()
     db.refresh(approval_message)
@@ -666,6 +699,7 @@ async def _run_plan_execute_background(
             plan = service.get_plan(plan_id)
             task = service.get_task(plan.task_id)
             task_id = task.id
+            metadata = {"execution": {"taskId": task.id, "planId": plan.id}}
             profile = get_model_profile(db, plan.model_profile_id)
             if plan.status != PLAN_STATUS_APPROVED:
                 raise AppError(
@@ -723,7 +757,7 @@ async def _run_plan_execute_background(
             metadata = orchestrator.metadata
             usage = orchestrator.usage
 
-            task.status = TASK_STATUS_EXECUTING
+            task.status = "done"
             task.updated_at = now_utc()
             _finish_message(db, execution_message_id, chat_id, execution_content, "done", metadata, usage)
             db.commit()
@@ -970,6 +1004,15 @@ def _get_streaming_profile(db: Session, model_profile_id: str | None) -> ModelPr
     return profile
 
 
+def _bind_requested_workspace(db: Session, chat: Chat, body: StartChatRunRequest) -> None:
+    if "workspace_path" in body.model_fields_set or body.workspace_mode is not None:
+        bind_workspace(
+            db, chat,
+            path=body.workspace_path if "workspace_path" in body.model_fields_set else chat.workspace_path,
+            mode=body.workspace_mode or chat.workspace_mode or "approve",
+        )
+
+
 def _get_or_create_chat(
     db: Session,
     chat_id: str | None,
@@ -1013,15 +1056,35 @@ def _load_done_history(db: Session, chat_id: str) -> list[dict[str, Any]]:
     rows = list(
         db.scalars(
             select(Message)
-            .where(Message.chat_id == chat_id, Message.status == "done")
+            .where(Message.chat_id == chat_id, Message.status.in_(["done", "cancelled", "interrupted", "error"]))
             .order_by(Message.created_at)
         ).all()
     )
-    return [
-        {"role": row.role, "content": row.content}
-        for row in rows
-        if row.role in {"system", "user", "assistant"}
-    ]
+    history = []
+    for row in rows:
+        if row.role not in {"system", "user", "assistant"}:
+            continue
+        metadata = _metadata_from_json(row.metadata_json) or {}
+        agent = metadata.get("workspaceAgent")
+        if row.status != "done" and not (row.role == "assistant" and isinstance(agent, dict)):
+            continue
+        content = row.content
+        if row.role == "assistant" and isinstance(agent, dict):
+            evidence = []
+            for call in agent.get("calls", [])[-20:]:
+                if not isinstance(call, dict):
+                    continue
+                arguments = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+                result = call.get("result") if isinstance(call.get("result"), dict) else {}
+                evidence.append({
+                    "tool": call.get("tool"), "status": call.get("status"),
+                    "target": str(arguments.get("path", arguments.get("command", "")))[:200],
+                    "ok": result.get("ok"), "exit_code": result.get("exit_code"),
+                })
+            summary = json.dumps({"run_status": row.status, "tools": evidence}, ensure_ascii=False)
+            content += "\n\n[Recorded workspace execution evidence]\n" + summary[:2500]
+        history.append({"role": row.role, "content": content})
+    return history
 
 
 def _create_message(
@@ -1208,6 +1271,8 @@ def _serialize_chat(chat: Chat | None) -> dict[str, Any] | None:
         "created_at": chat.created_at,
         "updated_at": chat.updated_at,
         "model_profile_id": chat.model_profile_id,
+        "workspace_path": chat.workspace_path,
+        "workspace_mode": chat.workspace_mode,
     }
 
 

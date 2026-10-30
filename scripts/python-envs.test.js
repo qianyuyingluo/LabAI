@@ -92,7 +92,7 @@ test("stable JSON and environment stamps are deterministic and sensitive to inpu
 test("requires the exact sandbox health capability before reusing a backend", () => {
   assert.equal(
     isCompatibleBackendHealth({
-      capabilities: { python_sandbox: true },
+      capabilities: { python_sandbox: true, workspace_agent: true },
       sandbox: { ready: true },
       status: "ok",
     }),

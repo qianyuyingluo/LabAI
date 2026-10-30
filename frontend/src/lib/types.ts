@@ -1,5 +1,25 @@
 export type MessageRole = "user" | "assistant" | "system";
-export type MessageStatus = "streaming" | "done" | "error";
+export type MessageStatus = "streaming" | "done" | "error" | "cancelled" | "interrupted";
+export type WorkspaceMode = "approve" | "auto";
+export type WorkspaceListing = {
+  path: string;
+  name: string;
+  relative_path?: string;
+  entries: Array<{ name: string; path: string; kind: "file" | "directory"; size?: number }>;
+  truncated: boolean;
+};
+export type WorkspaceAgentMetadata = {
+  workspacePath: string;
+  status: "running" | "waiting_approval" | "done" | "error" | "cancelled" | "interrupted";
+  error?: string;
+  calls: Array<{
+    id: string;
+    tool: string;
+    arguments: Record<string, unknown>;
+    status: "running" | "waiting_approval" | "done" | "error" | "denied" | "cancelled" | "interrupted";
+    result?: Record<string, unknown>;
+  }>;
+};
 export type MessageType = "text" | "plan" | "execution_result" | "error";
 export type PlanStatus =
   | "streaming"
@@ -34,6 +54,12 @@ export type FilesSkillMetadata = {
     extractedChars: number;
     includedChars: number;
     truncated: boolean;
+    parseStatus?: "success" | "partial" | "unsupported" | "error";
+    parseWarnings?: string[];
+    parseTruncated?: boolean;
+    contextTruncated?: boolean;
+    includedBlockIds?: string[];
+    totalBlocks?: number;
     error?: string;
     skillOutputChars?: number;
     skillOutput?: string;
@@ -50,6 +76,22 @@ export type PythonSandboxMetadata = {
   status: "running" | "done" | "error" | "skipped" | string;
   callCount: number;
   error?: string;
+};
+
+export type DocumentToolsMetadata = {
+  callCount: number;
+  calls: Array<{
+    tool: string;
+    ok: boolean;
+    fileId?: string;
+    filename?: string;
+    parseStatus?: string;
+    blockIds?: string[];
+    nextBlock?: number | null;
+    nextOffset?: number | null;
+    truncated?: boolean;
+    error?: string;
+  }>;
 };
 
 export type GeneratedFile = {
@@ -78,7 +120,9 @@ export type ChatMessage = {
   createdAt: number;
   attachments?: Attachment[];
   filesSkill?: FilesSkillMetadata;
+  documentTools?: DocumentToolsMetadata;
   pythonSandbox?: PythonSandboxMetadata;
+  workspaceAgent?: WorkspaceAgentMetadata;
   generatedFiles?: GeneratedFile[];
   planMode?: boolean;
   plainMode?: boolean;
@@ -93,6 +137,8 @@ export type ChatMessage = {
 };
 
 export type ChatHistoryItem = {
+  workspace_path?: string | null;
+  workspace_mode?: WorkspaceMode;
   id: string;
   title: string;
   created_at: string;
@@ -104,6 +150,7 @@ export type ChatHistoryItem = {
 };
 
 export type ChatMessageMetadata = {
+  workspaceAgent?: WorkspaceAgentMetadata;
   attachments?: Array<{
     fileId: string;
     name: string;
@@ -111,6 +158,7 @@ export type ChatMessageMetadata = {
     type: string;
   }>;
   filesSkill?: FilesSkillMetadata;
+  documentTools?: DocumentToolsMetadata;
   pythonSandbox?: PythonSandboxMetadata;
   generatedFiles?: GeneratedFile[];
   planMode?: boolean;
@@ -125,6 +173,8 @@ export type ChatMessageMetadata = {
 };
 
 export type ChatHistoryDetail = {
+  workspace_path?: string | null;
+  workspace_mode?: WorkspaceMode;
   id: string;
   title: string;
   created_at: string;

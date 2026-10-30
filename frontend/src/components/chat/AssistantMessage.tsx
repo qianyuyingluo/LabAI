@@ -21,6 +21,7 @@ import {
 import { copy, type Locale } from "@/lib/i18n";
 import type { ChatMessage, GeneratedFile } from "@/lib/types";
 import { getUploadedFileUrl, getUploadedImageUrl } from "@/lib/api";
+import { AgentTrace } from "@/components/chat/AgentTrace";
 import { StreamingMarkdown } from "@/components/chat/StreamingMarkdown";
 
 type AssistantMessageProps = {
@@ -43,11 +44,11 @@ export function AssistantMessage({
   const filesSkillLabel =
     locale === "zh"
       ? filesSkillRunning
-        ? "正在使用 files_skill"
-        : "files_skill"
+        ? "正在读取文件"
+        : "文件内容"
       : filesSkillRunning
-        ? "Using files_skill"
-        : "files_skill";
+        ? "Reading files"
+        : "File context";
 
   return (
     <div className="group flex gap-3">
@@ -72,7 +73,7 @@ export function AssistantMessage({
                 {filesSkill.files?.length ? (
                   <span className="shrink-0">{filesSkill.files.length} file(s)</span>
                 ) : null}
-                {filesSkill.truncated ? <span className="shrink-0">truncated</span> : null}
+                {filesSkill.truncated ? <span className="shrink-0">{locale === "zh" ? "包含部分内容" : "Partial content"}</span> : null}
               </span>
               <ChevronDown
                 className={`h-3.5 w-3.5 shrink-0 transition ${filesOpen ? "rotate-180" : ""}`}
@@ -87,12 +88,23 @@ export function AssistantMessage({
                         <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                           <span className="font-medium text-ink">{file.filename}</span>
                           <span>{file.fileType}</span>
-                          <span>{file.includedChars}/{file.extractedChars} chars</span>
+                          <span>{locale === "zh" ? "初始上下文" : "Initial context"}: {file.includedChars}/{file.extractedChars} {locale === "zh" ? "字符" : "chars"}</span>
+                          {file.parseStatus ? (
+                            <span>{locale === "zh" ? ({ success: "解析完成", partial: "部分解析", unsupported: "暂不支持解析", error: "解析失败" }[file.parseStatus]) : file.parseStatus}</span>
+                          ) : null}
                           {file.skillOutputChars ? <span>{file.skillOutputChars} answer chars</span> : null}
-                          {file.truncated ? <span>truncated</span> : null}
+                          {file.contextTruncated ? <span>{locale === "zh" ? "原文未全部加入上下文，可继续读取" : "More source content available to read"}</span> : null}
+                          {file.parseTruncated ? <span className="text-amber-600">{locale === "zh" ? "解析达到资源上限" : "Extraction reached a resource limit"}</span> : null}
+                          {file.truncated && file.contextTruncated === undefined ? <span>truncated</span> : null}
                           {file.error ? <span className="text-red-600">{file.error}</span> : null}
                           {file.skillError ? <span className="text-red-600">{file.skillError}</span> : null}
                         </div>
+                        {file.includedBlockIds?.length ? (
+                          <p className="break-words">{locale === "zh" ? "已提供内容块" : "Included blocks"}: {file.includedBlockIds.join(", ")}</p>
+                        ) : null}
+                        {file.parseWarnings?.map((warning, index) => (
+                          <p className="break-words text-amber-600" key={`${index}-${warning}`}>{warning}</p>
+                        ))}
                         {file.skillOutput ? (
                           <pre className="max-h-44 overflow-auto whitespace-pre-wrap text-[11px] leading-5 text-muted">
                             {file.skillOutput}
@@ -118,6 +130,23 @@ export function AssistantMessage({
             )}
           </div>
         )}
+        {message.documentTools?.calls.length ? (
+          <details className="mb-2 rounded-lg border border-line bg-panel px-3 py-2 text-xs text-muted">
+            <summary className="cursor-pointer">{locale === "zh" ? "本轮原文查阅" : "Source lookups"} · {message.documentTools.callCount}</summary>
+            <div className="mt-2 space-y-2">
+              {message.documentTools.calls.map((call, index) => (
+                <div className="break-words" key={index}>
+                  <span className="font-medium">{call.filename || call.fileId || (locale === "zh" ? "文件" : "File")}</span>
+                  {" · "}{call.tool === "search_file" ? (locale === "zh" ? "搜索" : "Search") : (locale === "zh" ? "读取" : "Read")}
+                  {call.blockIds?.length ? ` · ${call.blockIds.join(", ")}` : ""}
+                  {call.truncated ? <span> · {locale === "zh" ? "有内容尚未返回" : "More content remains"}</span> : null}
+                  {call.error ? <p className="text-red-600">{call.error}</p> : null}
+                </div>
+              ))}
+            </div>
+          </details>
+        ) : null}
+        <AgentTrace locale={locale} message={message} />
         <StreamingMarkdown
           content={content}
           emptyLabel={t.assistantEmpty}
@@ -145,6 +174,9 @@ export function AssistantMessage({
               <Check className="h-3.5 w-3.5" />
               {t.done}
             </span>
+          )}
+          {(message.status === "cancelled" || message.status === "interrupted") && (
+            <span className="ml-1 text-xs text-muted">{locale === "zh" ? (message.status === "cancelled" ? "已停止" : "执行中断") : message.status}</span>
           )}
           {isStreaming && (
             <span className="ml-1 text-xs text-muted">{t.analysisRunning}</span>

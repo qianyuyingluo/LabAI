@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 
 from app.db.models import UploadedFile
+from app.parsers.types import ContentBlock
 
 
 @dataclass(slots=True)
@@ -8,6 +9,7 @@ class FilesSkillInput:
     files: list[UploadedFile]
     max_context_chars: int
     preview_chars: int = 4000
+    user_message: str = ""
 
 
 @dataclass(slots=True)
@@ -25,6 +27,12 @@ class FilesSkillFileResult:
     skill_output: str = ""
     skill_output_chars: int = 0
     skill_error: str | None = None
+    blocks: list[ContentBlock] = field(default_factory=list)
+    parse_status: str = "success"
+    parse_warnings: list[str] = field(default_factory=list)
+    parse_truncated: bool = False
+    context_truncated: bool = False
+    included_block_ids: list[str] = field(default_factory=list)
 
     def to_metadata(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -37,6 +45,11 @@ class FilesSkillFileResult:
             "includedChars": self.included_chars,
             "truncated": self.truncated,
             "skillOutputChars": self.skill_output_chars,
+            "parseStatus": self.parse_status,
+            "parseWarnings": self.parse_warnings,
+            "parseTruncated": self.parse_truncated,
+            "contextTruncated": self.context_truncated,
+            "includedBlockIds": self.included_block_ids,
         }
         if self.error:
             payload["error"] = self.error
@@ -70,5 +83,7 @@ class FilesSkillResult:
             "totalExtractedChars": self.total_extracted_chars,
             "includedChars": self.included_chars,
             "truncated": self.truncated,
+            "parseTruncated": any(file.parse_truncated for file in self.files),
+            "contextTruncated": any(file.context_truncated for file in self.files),
             "errors": self.errors,
         }

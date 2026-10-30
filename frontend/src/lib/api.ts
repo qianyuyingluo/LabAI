@@ -9,6 +9,8 @@ import type {
   ModelProfile,
   ModelProfileInput,
   PlanPrompt,
+  WorkspaceMode,
+  WorkspaceListing,
 } from "@/lib/types";
 
 export type UploadedImage = {
@@ -24,6 +26,8 @@ export type UploadedFile = UploadedImage & {
 };
 
 export type ChatStreamRequest = {
+  workspace_path?: string | null;
+  workspace_mode?: WorkspaceMode;
   chat_id?: string | null;
   model_profile_id?: string | null;
   message: string;
@@ -52,6 +56,8 @@ export type BackendMessage = {
 export type RunStartResponse = {
   chat_id: string;
   chat?: {
+    workspace_path?: string | null;
+    workspace_mode?: WorkspaceMode;
     id: string;
     title: string;
     created_at: string;
@@ -110,6 +116,49 @@ export async function startChatRun(input: ChatStreamRequest) {
     body: JSON.stringify(input),
     method: "POST",
   });
+}
+
+export function inspectWorkspace(path: string) {
+  return requestJson<WorkspaceListing>("/api/workspaces/inspect", {
+    method: "POST", body: JSON.stringify({ path }),
+  });
+}
+
+export function pickWorkspaceFolder(initialPath?: string, signal?: AbortSignal) {
+  return requestJson<{ path: string | null; cancelled: boolean }>("/api/workspaces/pick-folder", {
+    method: "POST", body: JSON.stringify({ initial_path: initialPath || null }), signal,
+  });
+}
+
+export function updateChatWorkspace(chatId: string, path: string | null, mode: WorkspaceMode) {
+  return requestJson<{ workspace_path: string | null; workspace_mode: WorkspaceMode }>(
+    `/api/chats/${encodeURIComponent(chatId)}/workspace`,
+    { method: "PATCH", body: JSON.stringify({ path, mode }) },
+  );
+}
+
+export function fetchWorkspace(chatId: string, path = ".") {
+  return requestJson<WorkspaceListing>(`/api/chats/${encodeURIComponent(chatId)}/workspace?path=${encodeURIComponent(path)}`);
+}
+
+export function fetchWorkspaceFile(chatId: string, path: string) {
+  return requestJson<{ path: string; content?: string; text?: string; truncated?: boolean }>(
+    `/api/chats/${encodeURIComponent(chatId)}/workspace/file?path=${encodeURIComponent(path)}`,
+  );
+}
+
+export function cancelRun(messageId: string) {
+  return requestJson<{ ok: boolean }>(`/api/runs/messages/${encodeURIComponent(messageId)}/cancel`, { method: "POST" });
+}
+
+export function approveToolCall(messageId: string, callId: string, approved: boolean) {
+  return requestJson<{ ok: boolean }>(`/api/runs/messages/${encodeURIComponent(messageId)}/approval`, {
+    method: "POST", body: JSON.stringify({ call_id: callId, approved }),
+  });
+}
+
+export function resumeRun(messageId: string) {
+  return requestJson<RunStartResponse>(`/api/runs/messages/${encodeURIComponent(messageId)}/resume`, { method: "POST" });
 }
 
 export async function startPlanGenerateRun(input: PlanStreamRequest) {

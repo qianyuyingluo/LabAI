@@ -15,6 +15,7 @@ from app.core.errors import (
 )
 from app.db.models import Chat, Message, ModelProfile, UploadedFile, now_utc
 from app.services.message_builder import MessageBuilder
+from app.services.legacy_run_guard import reject_legacy_workspace_run
 from app.services.model_service import get_model_profile, system_prompt_messages
 from app.services.tool_orchestrator import ToolOrchestrator
 
@@ -277,6 +278,7 @@ def _prepare_chat(
     profile: ModelProfile,
     message: str,
 ) -> tuple[Chat, list[dict[str, Any]]]:
+    reject_legacy_workspace_run(db, chat_id)
     if chat_id:
         chat = db.get(Chat, chat_id)
         if chat is None:

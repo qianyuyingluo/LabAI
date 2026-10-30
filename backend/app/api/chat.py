@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_session
 from app.services.chat_service import run_chat, stream_chat
+from app.services.legacy_run_guard import reject_legacy_workspace_run
 from app.services.model_service import get_model_profile
 from app.skills.files_skill import FilesSkillService
 
@@ -40,6 +41,7 @@ class ChatResponse(BaseModel):
 
 @router.post("", response_model=ChatResponse)
 async def chat(request: ChatRequest, db: Session = Depends(get_session)) -> ChatResponse:
+    reject_legacy_workspace_run(db, request.chat_id)
     file_summaries = await _resolve_file_contexts(
         db,
         request.chat_id,
@@ -68,6 +70,7 @@ async def chat_stream(
     body: ChatRequest,
     db: Session = Depends(get_session),
 ) -> StreamingResponse:
+    reject_legacy_workspace_run(db, body.chat_id)
     file_summaries = await _resolve_file_contexts(
         db,
         body.chat_id,

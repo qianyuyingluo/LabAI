@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, UploadFile
@@ -8,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_session
 from app.core.errors import FILE_NOT_FOUND, AppError
 from app.services.file_service import get_uploaded_file, get_uploaded_image, save_uploaded_file, save_uploaded_image
+from app.services.document_service import snapshot_uploaded_file
 from app.skills.files_skill import FilesSkillService
 
 
@@ -46,13 +48,15 @@ async def upload_file(
     db: Session = Depends(get_session),
 ) -> UploadFileResponse:
     uploaded = await save_uploaded_file(db, file)
+    service = FilesSkillService(db)
+    summary = await asyncio.to_thread(service.build_upload_summary, snapshot_uploaded_file(uploaded))
     return UploadFileResponse(
         file_id=uploaded.id,
         filename=uploaded.original_filename,
         mime_type=uploaded.mime_type,
         size=uploaded.size,
         file_type=uploaded.file_type,
-        summary=FilesSkillService(db).build_upload_summary(uploaded),
+        summary=summary,
     )
 
 

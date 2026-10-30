@@ -219,7 +219,7 @@ class PythonSandboxWorkspace:
         output_limited = False
         async with _sandbox_semaphore():
             with stdout_path.open("wb") as stdout_handle, stderr_path.open("wb") as stderr_handle:
-                process = await asyncio.create_subprocess_exec(
+                spawning = asyncio.create_task(asyncio.create_subprocess_exec(
                     str(python),
                     "-I",
                     "-B",
@@ -232,7 +232,15 @@ class PythonSandboxWorkspace:
                     stdout=stdout_handle,
                     stderr=stderr_handle,
                     **process_kwargs,
-                )
+                ))
+                try:
+                    # Cancellation during process creation must still obtain the
+                    # handle, otherwise a process can outlive the cancelled run.
+                    process = await asyncio.shield(spawning)
+                except asyncio.CancelledError:
+                    process = await spawning
+                    await _terminate_process_tree(process)
+                    raise
                 monitor_state = {"memory_limited": False, "output_limited": False}
                 monitor = asyncio.create_task(
                     _monitor_process(
@@ -248,6 +256,11 @@ class PythonSandboxWorkspace:
                 except TimeoutError:
                     timed_out = True
                     await _terminate_process_tree(process)
+                except asyncio.CancelledError:
+                    # Stop and reap before the caller removes this workspace or
+                    # reports the run as cancelled to the UI.
+                    await _terminate_process_tree(process)
+                    raise
                 finally:
                     monitor.cancel()
                     try:
@@ -782,19 +795,30 @@ def _process_tree_memory(pid: int) -> int | None:
 
 
 async def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:
-    try:
-        import psutil
+    import psutil
 
+    children = []
+    try:
         parent = psutil.Process(process.pid)
         children = parent.children(recursive=True)
-        for child in children:
-            child.kill()
-        parent.kill()
-    except Exception:
+        for child in reversed(children):
+            try:
+                child.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        try:
+            parent.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        pass
+    if process.returncode is None:
         try:
             process.kill()
         except ProcessLookupError:
             pass
+    if children:
+        await asyncio.to_thread(psutil.wait_procs, children, timeout=5)
     try:
         await asyncio.wait_for(process.wait(), timeout=5)
     except Exception:

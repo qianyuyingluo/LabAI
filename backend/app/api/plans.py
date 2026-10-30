@@ -17,6 +17,7 @@ from app.core.errors import (
 )
 from app.db.models import AnalysisPlan, AnalysisTask, Chat, Message, ModelProfile, now_utc
 from app.services.chat_service import format_sse
+from app.services.legacy_run_guard import reject_legacy_workspace_run
 from app.services.model_service import get_model_profile
 from app.services.plan_execution_service import PLAN_APPROVAL_USER_MESSAGE, PlanExecutionService
 from app.services.plan_service import (
@@ -56,6 +57,7 @@ async def generate_plan_stream(
     body: GeneratePlanRequest,
     db: Session = Depends(get_session),
 ) -> StreamingResponse:
+    reject_legacy_workspace_run(db, body.chat_id)
     return _sse_response(_generate_plan_events(db, request, body))
 
 
@@ -65,6 +67,7 @@ async def approve_plan_stream(
     request: Request,
     db: Session = Depends(get_session),
 ) -> StreamingResponse:
+    _reject_legacy_workspace_plan(db, plan_id)
     return _sse_response(_approve_and_execute_events(db, request, plan_id))
 
 
@@ -75,7 +78,15 @@ async def revise_plan_stream(
     body: RevisePlanRequest,
     db: Session = Depends(get_session),
 ) -> StreamingResponse:
+    _reject_legacy_workspace_plan(db, plan_id)
     return _sse_response(_revise_plan_events(db, request, plan_id, body))
+
+
+def _reject_legacy_workspace_plan(db: Session, plan_id: str) -> None:
+    service = PlanService(db)
+    plan = service.get_plan(plan_id)
+    task = service.get_task(plan.task_id)
+    reject_legacy_workspace_run(db, task.chat_id)
 
 
 @router.get("/{plan_id}")
@@ -245,6 +256,7 @@ async def _revise_plan_events(
 ) -> AsyncIterator[str]:
     task: AnalysisTask | None = None
     try:
+        _reject_legacy_workspace_plan(db, plan_id)
         plan_service = PlanService(db)
         previous_plan = plan_service.get_plan(plan_id)
         if previous_plan.status != PLAN_STATUS_AWAITING_APPROVAL:
@@ -364,6 +376,7 @@ async def _approve_and_execute_events(
     terminalized = False
     try:
         service = PlanService(db)
+        _reject_legacy_workspace_plan(db, plan_id)
         plan = service.approve_plan(plan_id)
         task = service.get_task(plan.task_id)
         task_id = task.id
@@ -573,6 +586,7 @@ def _get_or_create_chat(
 
 
 def _ensure_chat_can_start(db: Session, chat_id: str) -> None:
+    reject_legacy_workspace_run(db, chat_id)
     streaming_count = db.scalar(
         select(func.count()).select_from(Message).where(
             Message.chat_id == chat_id,
